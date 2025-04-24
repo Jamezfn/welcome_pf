@@ -127,10 +127,6 @@ float measureRMS(int pin, float offset, int count, bool isVoltage) {
 }
 
 //--------------------- Setup & Loop ---------------------
-void IRAM_ATTR zeroCrossingISR() {
-  // Record timestamp and set flag
-}
-
 void setup() {
   Serial.begin(115200);
   analogSetAttenuation(ADC_11db);
@@ -142,10 +138,8 @@ void setup() {
   filteredVoltage = analogRead(voltagePin);
   filteredCurrent = analogRead(currentPin);
   Serial.println("Enhanced Synchronous PF Correction Starting (Median Filtering)");
-
-
-  attachInterrupt(digitalPinToInterrupt(2), zeroCrossingISR, RISING);
 }
+
 void loop() {
   long sumDt = 0;
   for (int c = 0; c < meas.cycles; c++) {
