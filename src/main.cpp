@@ -256,5 +256,5 @@ void loop() {
   // --- Normal PF correction with debounce & hysteresis ---
   updatePFCState(medAngle);
 
-  delay(2000);
+  delay(20);
 }
