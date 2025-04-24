@@ -1,199 +1,175 @@
 #include <Arduino.h>
 #include <math.h>
 
-// ADC pins and configuration
-const int voltagePin         = 35;
-const int currentPin         = 34;
-const float voltageReference = 3.3;
-const int ADCResolution      = 4095;
+//–– ADC & timing consts
+constexpr int VIN_PIN   = 35;
+constexpr int IIN_PIN   = 34;
+constexpr float VREF    = 3.3f;
+constexpr int   ADC_MAX = 4095;
+constexpr float ADC2V   = VREF / ADC_MAX;
+constexpr float ANGLE_F = 360.0f / (1000000.0f / 50.0f);  // =360° per period
 
-// Relay pins for capacitor and inductor banks
-enum RelayPins { CAP_RELAY = 25, IND_RELAY = 26 };
+//–– Relays
+constexpr int CAP_RELAY = 25;
+constexpr int IND_RELAY = 26;
 
-// Global calibration variables
-float zeroOffsetVoltage = 0.0;
-float zeroOffsetCurrent = 0.0;
+//–– Calibration
+static float zeroV = 0, zeroI = 0;
 
-// Scaling and sensitivity factors
-const float voltageScalingFactor = 0.723;
-const float currentSensitivity   = 0.185;
+//–– Scaling factors
+constexpr float V_SCALE = 0.723f;
+constexpr float I_SENS  = 0.185f;
 
-// AC parameters
-const float acFrequency  = 50.0;
-const unsigned long periodMicros = (unsigned long)(1000000 / acFrequency);
+//–– Filtering & median
+struct Ms { int cycles; float alpha; };
+static const Ms MS = { 250, 0.1f };
+static float filtV = 0, filtI = 0;
+constexpr int MED_SZ = 5;
+static float angles[MED_SZ] = {0};
+static int   aidx = 0;
 
-// Measurement and filtering settings
-// Increased NUM_CYCLES to average over more zero-crossings to reduce jitter
-typedef struct { int cycles; float alpha; } MeasurementSettings;
-MeasurementSettings meas = { 250, 0.1 };
-float filteredVoltage = 0;
-float filteredCurrent = 0;
+//–– Thresholds (deg)
+static const float CAP_E  = acos(0.80f) * 180/PI;
+static const float CAP_D  = acos(0.95f) * 180/PI;
+static const float IND_E  = -40.0f;
+static const float IND_D  =   5.0f;
 
-// Median filter settings for phase angle
-const int ANGLE_MEDIAN_SIZE = 5;
-float angleBuffer[ANGLE_MEDIAN_SIZE] = {0};
-int   angleIndex = 0;
+//–– State
+enum State { MON, CAP, IND } state = MON;
 
-// Power factor thresholds for hysteresis
-typedef struct { float engageAngle; float disengageAngle; } AngleThresholds;
-// Capacitor: engage at +36.87°, disengage at +18.19°
-// Inductor: engage at -40°, disengage at +5°
-AngleThresholds capThresh = { acos(0.80)*180.0/PI, acos(0.95)*180.0/PI };
-AngleThresholds indThresh = { -40.0, 5.0 };
+//–– Simple in-place insertion sort + median
+static float getMedian() {
+  float buf[MED_SZ];
+  memcpy(buf, angles, sizeof buf);
+  for (int i=1; i<MED_SZ; i++){
+    float k=buf[i]; int j=i-1;
+    while(j>=0 && buf[j]>k){ buf[j+1]=buf[j]; j--; }
+    buf[j+1]=k;
+  }
+  return buf[MED_SZ/2];
+}
 
-// State machine for power factor correction
-enum PFCState { MONITORING, CAP_CORRECTION, IND_CORRECTION, CALIBRATING };
-PFCState currentState = MONITORING;
+//–– Single-pass EMA
+static inline void ema(float &f, float raw){
+  f = MS.alpha * raw + (1 - MS.alpha) * f;
+}
 
-//--------------------- Helpers ---------------------
-float medianAngle(float *buf, int size) {
-  float temp[ANGLE_MEDIAN_SIZE];
-  for (int i = 0; i < size; i++) temp[i] = buf[i];
-  // Simple insertion sort for small array
-  for (int i = 1; i < size; i++) {
-    float key = temp[i];
-    int j = i - 1;
-    while (j >= 0 && temp[j] > key) {
-      temp[j+1] = temp[j];
-      j--;
+//–– Zero-cross time diff over many cycles
+static float measurePhase() {
+  uint32_t dtSum = 0;
+  for(int c=0; c<MS.cycles; c++){
+    // wait for V zero‐cross
+    uint32_t t0;
+    float prev = analogRead(VIN_PIN);
+    ema(filtV, prev);
+    while(true) {
+      float v = analogRead(VIN_PIN);
+      ema(filtV, v);
+      if (prev < zeroV && filtV >= zeroV) { t0 = micros(); break; }
+      prev = filtV;
+      yield();
     }
-    temp[j+1] = key;
+    // wait for I zero‐cross
+    uint32_t t1;
+    prev = analogRead(IIN_PIN);
+    ema(filtI, prev);
+    while(true) {
+      float i = analogRead(IIN_PIN);
+      ema(filtI, i);
+      if (prev < zeroI && filtI >= zeroI) { t1 = micros(); break; }
+      prev = filtI;
+      yield();
+    }
+    dtSum += (t1 - t0);
+    yield();
   }
-  return temp[size/2];
+  float avgDt = float(dtSum) / MS.cycles;
+  float angle = avgDt * ANGLE_F;
+  // wrap to [-180,180]
+  if (angle > 180) angle -= 360;
+  else if (angle < -180) angle += 360;
+  return angle;
 }
 
-void updatePFCState(float phaseAngle) {
-  switch (currentState) {
-    case MONITORING:
-      if (phaseAngle > capThresh.engageAngle) {
-        digitalWrite(CAP_RELAY, HIGH);
-        digitalWrite(IND_RELAY, LOW);
-        currentState = CAP_CORRECTION;
-        Serial.println("Capacitor Bank ENGAGED");
-      } else if (phaseAngle < indThresh.engageAngle) {
-        digitalWrite(IND_RELAY, HIGH);
-        digitalWrite(CAP_RELAY, LOW);
-        currentState = IND_CORRECTION;
-        Serial.println("Inductor Bank ENGAGED");
-      }
+//–– Batch RMS measurement
+static float measureRMS(int pin, float offset, bool isV) {
+  uint32_t sumSq = 0;
+  for(int i=0; i<1000; i++){
+    int r = analogRead(pin);
+    float v = (r - offset) * ADC2V;
+    uint32_t sq = uint32_t(v * v * 1e6);  // scale to avoid float ops inside loop
+    sumSq += sq;
+  }
+  float rms = sqrt(sumSq / 1000.0f * 1e-6f);
+  return isV ? rms * V_SCALE : rms / I_SENS;
+}
+
+//–– Helpers
+static void updateRelays(float angle) {
+  switch(state) {
+    case MON:
+      if (angle > CAP_E) { digitalWrite(CAP_RELAY, HIGH); digitalWrite(IND_RELAY, LOW); state=CAP; Serial.println("Cap ON"); }
+      else if (angle < IND_E) { digitalWrite(IND_RELAY, HIGH); digitalWrite(CAP_RELAY, LOW); state=IND; Serial.println("Ind ON"); }
       break;
-    case CAP_CORRECTION:
-      if (phaseAngle < capThresh.disengageAngle) {
-        digitalWrite(CAP_RELAY, LOW);
-        currentState = MONITORING;
-        Serial.println("Capacitor Bank DISENGAGED");
-      }
+    case CAP:
+      if (angle < CAP_D) { digitalWrite(CAP_RELAY, LOW); state=MON; Serial.println("Cap OFF"); }
       break;
-    case IND_CORRECTION:
-      if (phaseAngle > indThresh.disengageAngle) {
-        digitalWrite(IND_RELAY, LOW);
-        currentState = MONITORING;
-        Serial.println("Inductor Bank DISENGAGED");
-      }
-      break;
-    case CALIBRATING:
+    case IND:
+      if (angle > IND_D) { digitalWrite(IND_RELAY, LOW); state=MON; Serial.println("Ind OFF"); }
       break;
   }
 }
 
-void calibrateSensors() {
-  Serial.println("Starting calibration. Ensure NO LOAD is connected...");
-  long vSum = 0, iSum = 0;
-  const int samples = 1000;
-  for (int i = 0; i < samples; i++) {
-    vSum += analogRead(voltagePin);
-    iSum += analogRead(currentPin);
+//–– Calibration
+static void calibrate() {
+  Serial.println("Calibrating...");
+  uint32_t vSum=0, iSum=0;
+  for(int i=0;i<1000;i++){
+    vSum += analogRead(VIN_PIN);
+    iSum += analogRead(IIN_PIN);
     delay(1);
   }
-  zeroOffsetVoltage = (float)vSum / samples;
-  zeroOffsetCurrent = (float)iSum / samples;
-  Serial.printf("Calibration complete. Voltage offset: %.2f, Current offset: %.2f\n", zeroOffsetVoltage, zeroOffsetCurrent);
+  zeroV = vSum / 1000.0f;
+  zeroI = iSum / 1000.0f;
+  Serial.printf("Zero offsets: V=%.2f I=%.2f\n", zeroV, zeroI);
 }
 
-void updateEMA(float &filt, int raw, float a) {
-  filt = a * raw + (1 - a) * filt;
-}
-
-float measureRMS(int pin, float offset, int count, bool isVoltage) {
-  double sumSq = 0;
-  for (int i = 0; i < count; i++) {
-    int r = analogRead(pin);
-    float v = (r - offset)*(voltageReference/ADCResolution);
-    sumSq += v*v;
-    delayMicroseconds(100);
-  }
-  float rms = sqrt(sumSq/count);
-  return isVoltage ? rms*voltageScalingFactor : rms/currentSensitivity;
-}
-
-//--------------------- Setup & Loop ---------------------
-void setup() {
+void setup(){
   Serial.begin(115200);
   analogSetAttenuation(ADC_11db);
   pinMode(CAP_RELAY, OUTPUT);
   pinMode(IND_RELAY, OUTPUT);
   digitalWrite(CAP_RELAY, LOW);
   digitalWrite(IND_RELAY, LOW);
-  calibrateSensors();
-  filteredVoltage = analogRead(voltagePin);
-  filteredCurrent = analogRead(currentPin);
-  Serial.println("Enhanced Synchronous PF Correction Starting (Median Filtering)");
+  calibrate();
+  filtV = zeroV;
+  filtI = zeroI;
 }
 
-void loop() {
-  long sumDt = 0;
-  for (int c = 0; c < meas.cycles; c++) {
-    unsigned long tV = 0, tI = 0;
-    bool vCross = false, iCross = false;
-    int pV = analogRead(voltagePin);
-    updateEMA(filteredVoltage, pV, meas.alpha);
-    while (!vCross) {
-      int rV = analogRead(voltagePin);
-      updateEMA(filteredVoltage, rV, meas.alpha);
-      if (pV < zeroOffsetVoltage && filteredVoltage >= zeroOffsetVoltage) {
-        tV = micros(); vCross = true;
-      }
-      pV = filteredVoltage;
-    }
-    int pI = analogRead(currentPin);
-    updateEMA(filteredCurrent, pI, meas.alpha);
-    while (!iCross) {
-      int rI = analogRead(currentPin);
-      updateEMA(filteredCurrent, rI, meas.alpha);
-      if (pI < zeroOffsetCurrent && filteredCurrent >= zeroOffsetCurrent) {
-        tI = micros(); iCross = true;
-      }
-      pI = filteredCurrent;
-    }
-    sumDt += (long)(tI - tV);
-    delay(2);
-  }
-  float avgDt = (float)sumDt / meas.cycles;
-  float angle = (avgDt/periodMicros)*360.0;
-  while (angle>180) angle-=360;
-  while (angle<-180) angle+=360;
-  // median filter
-  angleBuffer[angleIndex] = angle;
-  angleIndex = (angleIndex+1)%ANGLE_MEDIAN_SIZE;
-  float medAngle = medianAngle(angleBuffer, ANGLE_MEDIAN_SIZE);
+void loop(){
+  float angle = measurePhase();
+  angles[aidx] = angle;
+  aidx = (aidx + 1) % MED_SZ;
+  float medA = getMedian();
 
-  float Vrms = measureRMS(voltagePin, zeroOffsetVoltage, 1000, true);
-  float Irms = measureRMS(currentPin, zeroOffsetCurrent, 1000, false);
-  float pf = cos(medAngle*PI/180.0);
-  float P  = Vrms*Irms*pf;
-  float S  = Vrms*Irms;
-  float Q  = sqrt(S*S - P*P);
+  float Vr = measureRMS(VIN_PIN, zeroV, true);
+  float Ir = measureRMS(IIN_PIN, zeroI, false);
+  float pf = cosf(medA * PI/180.0f);
+  float P  = Vr * Ir * pf;
+  float S  = Vr * Ir;
+  float Q  = sqrtf(S*S - P*P);
 
-  Serial.printf("Raw Angle: %.1f°, Median Angle: %.1f°, PF: %.3f\n", angle, medAngle, pf);
-  Serial.printf("Vrms: %.2f V, Irms: %.3f A | P: %.2f W, S: %.2f VA, Q: %.2f VAR\n", Vrms, Irms, P, S, Q);
+  Serial.printf("Ang: %.1f° Med: %.1f° PF: %.3f\n", angle, medA, pf);
+  Serial.printf("Vr=%.2fV Ir=%.3fA P=%.2fW S=%.2fVA Q=%.2fVAR\n", Vr, Ir, P, S, Q);
 
-  if (Vrms < 0.1) {
+  if (Vr < 0.1f) {
     digitalWrite(CAP_RELAY, LOW);
     digitalWrite(IND_RELAY, LOW);
-    currentState = MONITORING;
-    Serial.println("AC OFF detected: Resetting PF correction state");
+    state = MON;
+    Serial.println("AC OFF → reset");
   } else {
-    updatePFCState(medAngle);
+    updateRelays(medA);
   }
+
   delay(2000);
 }
