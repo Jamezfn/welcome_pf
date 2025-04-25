@@ -1,61 +1,51 @@
 #include <Arduino.h>
 #include <math.h>
 
-// ADC pins and configuration
 const int voltagePin         = 35;
 const int currentPin         = 34;
 const float voltageReference = 3.3;
 const int ADCResolution      = 4095;
 
-// Relay pins for capacitor and inductor banks
 enum RelayPins { CAP_RELAY = 25, IND_RELAY = 26 };
 
-// Global calibration variables
 float zeroOffsetVoltage = 0.0;
 float zeroOffsetCurrent = 0.0;
 
-// Scaling and sensitivity factors
 const float voltageScalingFactor = 0.723;
 const float currentSensitivity   = 0.185;
 
-// AC parameters
 const float acFrequency  = 50.0;
 const unsigned long periodMicros = (unsigned long)(1000000 / acFrequency);
 
-// Measurement and filtering settings
 typedef struct { int cycles; float alpha; } MeasurementSettings;
 MeasurementSettings meas = { 250, 0.1 };
 float filteredVoltage = 0;
 float filteredCurrent = 0;
 
-// Median filter settings for phase angle
 const int ANGLE_MEDIAN_SIZE = 5;
 float angleBuffer[ANGLE_MEDIAN_SIZE] = {0};
 int   angleIndex = 0;
 
-// Power factor thresholds for hysteresis
 typedef struct { float engageAngle; float disengageAngle; } AngleThresholds;
 AngleThresholds capThresh = { acos(0.80)*180.0/PI, acos(0.95)*180.0/PI };
-AngleThresholds indThresh = { -40.0, 10.0 };
+AngleThresholds indThresh = { -40.0, 30.0 };
 
-// State machine
 enum PFCState { MONITORING, CAP_CORRECTION, IND_CORRECTION, CALIBRATING };
 PFCState currentState = MONITORING;
 
-// No-load & debounce
 const float noLoadVoltage = 0.15;
-const int REQUIRED_STABLE_READINGS = 3;
+const int REQUIRED_STABLE_READINGS = 5; 
 int stableReadingCount = 0;
 
 const unsigned long minSwitchInterval = 5000;
 unsigned long lastSwitchTime = 0;
 
-// Cooldown globals
+
 const unsigned long switchCooldownPeriod = 10000;
 bool inCooldownPeriod = false;
 unsigned long cooldownStartTime = 0;
 
-// Helpers
+
 float medianAngle(float *buf, int size) {
   float temp[ANGLE_MEDIAN_SIZE];
   memcpy(temp, buf, sizeof(temp));
@@ -153,7 +143,6 @@ void setup(){
 }
 
 void loop(){
-  // Cooldown
   if(inCooldownPeriod){
     if(millis()-cooldownStartTime<switchCooldownPeriod){
       Serial.printf("In cooldown period: %lu/%lu ms\n",millis()-cooldownStartTime,switchCooldownPeriod);
@@ -161,7 +150,6 @@ void loop(){
     }else{inCooldownPeriod=false;Serial.println("Cooldown period ended");}
   }
 
-  // Phase-angle measurement
   long sumDt=0;
   for(int c=0;c<meas.cycles;c++){
     unsigned long tV=0,tI=0;bool vCross=false,iCross=false;
@@ -179,7 +167,7 @@ void loop(){
   angleBuffer[angleIndex]=angle;angleIndex=(angleIndex+1)%ANGLE_MEDIAN_SIZE;
   float medAngle=medianAngle(angleBuffer,ANGLE_MEDIAN_SIZE);
 
-  // RMS & power
+
   float Vrms=measureRMS(voltagePin,zeroOffsetVoltage,1000,true);
   float Irms=measureRMS(currentPin,zeroOffsetCurrent,1000,false);
   float pf=cos(medAngle*PI/180.0);
@@ -190,7 +178,7 @@ void loop(){
   Serial.printf("Raw Angle: %.1f°, Median Angle: %.1f°, PF: %.3f\n",angle,medAngle,pf);
   Serial.printf("Vrms: %.2f V, Irms: %.3f A | P: %.2f W, S: %.2f VA, Q: %.2f VAR\n",Vrms,Irms,P,S,Q);
 
-  // No-load reset
+
   if(Vrms<noLoadVoltage){
     digitalWrite(CAP_RELAY,LOW);digitalWrite(IND_RELAY,LOW);
     currentState=MONITORING;lastSwitchTime=millis();
@@ -198,7 +186,7 @@ void loop(){
     delay(2000);return;
   }
 
-  // Stability & PFC update
+
   if(!isAngleStable(angle,medAngle)){
     Serial.println("Angle instability detected - skipping PFC update");
     stableReadingCount=0;delay(500);return;
