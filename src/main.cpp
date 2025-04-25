@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h> 
 
 const int voltagePin         = 35;
 const int currentPin         = 34;
@@ -40,11 +43,31 @@ int stableReadingCount = 0;
 const unsigned long minSwitchInterval = 5000;
 unsigned long lastSwitchTime = 0;
 
-
 const unsigned long switchCooldownPeriod = 10000;
 bool inCooldownPeriod = false;
 unsigned long cooldownStartTime = 0;
 
+const char* WIFI_SSID = "Hedy fidelity";
+const char* WIFI_PASS = "Onecaster2020";
+const char* PREDICT_URL = "http://192.168.7.219:5000/predict";
+
+void reconnectWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Reconnecting to WiFi...");
+    WiFi.reconnect();
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println(" connected!");
+    } else {
+      Serial.println(" failed!");
+    }
+  }
+}
 
 float medianAngle(float *buf, int size) {
   float temp[ANGLE_MEDIAN_SIZE];
@@ -115,7 +138,8 @@ void calibrateSensors(){
   for(int i=0;i<samples;i++){vSum+=analogRead(voltagePin);iSum+=analogRead(currentPin);delay(1);}  
   zeroOffsetVoltage=(float)vSum/samples;
   zeroOffsetCurrent=(float)iSum/samples;
-  Serial.printf("Calibration complete. Voltage offset: %.2f, Current offset: %.2f\n",zeroOffsetVoltage,zeroOffsetCurrent);
+  Serial.printf("Calibration complete. Voltage offset: %.2f, Current offset: %.2f\n",
+                zeroOffsetVoltage, zeroOffsetCurrent);
 }
 
 void updateEMA(float &filt,int raw,float a){filt=a*raw+(1-a)*filt;}
@@ -131,11 +155,60 @@ float measureRMS(int pin,float offset,int count,bool isVoltage){
   return isVoltage?rms*voltageScalingFactor:rms/currentSensitivity;
 }
 
+
+float sendForPrediction(float P, float I, float pf) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost—skipping predict");
+    return NAN;
+  }
+
+  StaticJsonDocument<256> doc;
+  JsonArray input = doc.createNestedArray("input");
+  JsonArray seq   = input.createNestedArray();
+  for(int i=0;i<10;i++){
+    JsonArray trip = seq.createNestedArray();
+    trip.add(P);
+    trip.add(I);
+    trip.add(pf);
+  }
+
+  String body;
+  serializeJson(doc, body);
+
+  HTTPClient http;
+  http.begin(PREDICT_URL);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+
+  float energy = NAN;
+  if(code == 200){
+    String resp = http.getString();
+    StaticJsonDocument<128> rdoc;
+    if(!deserializeJson(rdoc, resp)){
+      energy = rdoc["energy_prediction"][0];
+    } else {
+      Serial.println("JSON parse err");
+    }
+  } else {
+    Serial.printf("HTTP err: %d\n", code);
+  }
+  http.end();
+  return energy;
+}
+
 void setup(){
   Serial.begin(115200);
   analogSetAttenuation(ADC_11db);
   pinMode(CAP_RELAY,OUTPUT);pinMode(IND_RELAY,OUTPUT);
   digitalWrite(CAP_RELAY,LOW);digitalWrite(IND_RELAY,LOW);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting WiFi");
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500); Serial.print(".");
+  }
+  Serial.println(" connected!");
+
   calibrateSensors();
   filteredVoltage=analogRead(voltagePin);
   filteredCurrent=analogRead(currentPin);
@@ -145,56 +218,77 @@ void setup(){
 void loop(){
   if(inCooldownPeriod){
     if(millis()-cooldownStartTime<switchCooldownPeriod){
-      Serial.printf("In cooldown period: %lu/%lu ms\n",millis()-cooldownStartTime,switchCooldownPeriod);
-      delay(1000);return;
-    }else{inCooldownPeriod=false;Serial.println("Cooldown period ended");}
+      Serial.printf("In cooldown: %lu/%lu ms\n",
+                    millis()-cooldownStartTime, switchCooldownPeriod);
+      delay(1000); return;
+    } else {
+      inCooldownPeriod=false;
+      Serial.println("Cooldown ended");
+    }
   }
 
   long sumDt=0;
   for(int c=0;c<meas.cycles;c++){
-    unsigned long tV=0,tI=0;bool vCross=false,iCross=false;
-    int pV=analogRead(voltagePin);updateEMA(filteredVoltage,pV,meas.alpha);
-    while(!vCross){int rV=analogRead(voltagePin);updateEMA(filteredVoltage,rV,meas.alpha);
-      if(pV<zeroOffsetVoltage && filteredVoltage>=zeroOffsetVoltage){tV=micros();vCross=true;}pV=filteredVoltage;}
-    int pI=analogRead(currentPin);updateEMA(filteredCurrent,pI,meas.alpha);
-    while(!iCross){int rI=analogRead(currentPin);updateEMA(filteredCurrent,rI,meas.alpha);
-      if(pI<zeroOffsetCurrent && filteredCurrent>=zeroOffsetCurrent){tI=micros();iCross=true;}pI=filteredCurrent;}
-    sumDt+=(long)(tI-tV);delay(2);
-  }
-  float avgDt=(float)sumDt/meas.cycles;
-  float angle=(avgDt/periodMicros)*360.0;
-  while(angle>180)angle-=360;while(angle<-180)angle+=360;
-  angleBuffer[angleIndex]=angle;angleIndex=(angleIndex+1)%ANGLE_MEDIAN_SIZE;
-  float medAngle=medianAngle(angleBuffer,ANGLE_MEDIAN_SIZE);
-
-
-  float Vrms=measureRMS(voltagePin,zeroOffsetVoltage,1000,true);
-  float Irms=measureRMS(currentPin,zeroOffsetCurrent,1000,false);
-  float pf=cos(medAngle*PI/180.0);
-  float P=Vrms*Irms*pf;
-  float S=Vrms*Irms;
-  float Q=sqrt(S*S-P*P);
-
-  Serial.printf("Raw Angle: %.1f°, Median Angle: %.1f°, PF: %.3f\n",angle,medAngle,pf);
-  Serial.printf("Vrms: %.2f V, Irms: %.3f A | P: %.2f W, S: %.2f VA, Q: %.2f VAR\n",Vrms,Irms,P,S,Q);
-
-
-  if(Vrms<noLoadVoltage){
-    digitalWrite(CAP_RELAY,LOW);digitalWrite(IND_RELAY,LOW);
-    currentState=MONITORING;lastSwitchTime=millis();
-    Serial.println("Low voltage detected: resetting all banks");
-    delay(2000);return;
+    unsigned long tV=0,tI=0; bool vCross=false,iCross=false;
+    int pV=analogRead(voltagePin); updateEMA(filteredVoltage,pV,meas.alpha);
+    while(!vCross){
+      int rV=analogRead(voltagePin); updateEMA(filteredVoltage,rV,meas.alpha);
+      if(pV<zeroOffsetVoltage && filteredVoltage>=zeroOffsetVoltage){
+        tV=micros(); vCross=true;
+      }
+      pV=filteredVoltage;
+    }
+    int pI=analogRead(currentPin); updateEMA(filteredCurrent,pI,meas.alpha);
+    while(!iCross){
+      int rI=analogRead(currentPin); updateEMA(filteredCurrent,rI,meas.alpha);
+      if(pI<zeroOffsetCurrent && filteredCurrent>=zeroOffsetCurrent){
+        tI=micros(); iCross=true;
+      }
+      pI=filteredCurrent;
+    }
+    sumDt += (long)(tI - tV);
+    delay(2);
   }
 
+  float avgDt = (float)sumDt / meas.cycles;
+  float angle = (avgDt / periodMicros) * 360.0;
+  while(angle>180) angle-=360;
+  while(angle<-180) angle+=360;
+  angleBuffer[angleIndex]=angle;
+  angleIndex = (angleIndex+1) % ANGLE_MEDIAN_SIZE;
+  float medAngle = medianAngle(angleBuffer, ANGLE_MEDIAN_SIZE);
+
+  float Vrms = measureRMS(voltagePin, zeroOffsetVoltage, 1000, true);
+  float Irms = measureRMS(currentPin, zeroOffsetCurrent, 1000, false);
+  float pf   = cos(medAngle * PI/180.0);
+  float P    = Vrms * Irms * pf;
+  float S    = Vrms * Irms;
+  float Q    = sqrt(S*S - P*P);
+
+  Serial.printf("Raw Angle: %.1f°, Med Angle: %.1f°, PF: %.3f\n",
+                angle, medAngle, pf);
+  Serial.printf("Vrms: %.2f V, Irms: %.3f A | P: %.2f W\n", Vrms, Irms, P);
+
+  float E = sendForPrediction(P, Irms, pf);
+  if (!isnan(E)) {
+    Serial.printf("Predicted energy: %.4f\n", E);
+  }
+
+  if(Vrms < noLoadVoltage){
+    digitalWrite(CAP_RELAY,LOW); digitalWrite(IND_RELAY,LOW);
+    currentState=MONITORING; lastSwitchTime=millis();
+    Serial.println("Low voltage detected: resetting banks");
+    delay(2000); return;
+  }
 
   if(!isAngleStable(angle,medAngle)){
-    Serial.println("Angle instability detected - skipping PFC update");
-    stableReadingCount=0;delay(500);return;
+    Serial.println("Angle unstable—skipping PFC update");
+    stableReadingCount=0; delay(500); return;
   }
   stableReadingCount++;
-  Serial.printf("Stable reading count: %d/%d\n",stableReadingCount,REQUIRED_STABLE_READINGS);
+  Serial.printf("Stable count: %d/%d\n", stableReadingCount, REQUIRED_STABLE_READINGS);
   if(stableReadingCount>=REQUIRED_STABLE_READINGS) updatePFCState(medAngle);
-  else Serial.println("Waiting for more stable readings before PFC update");
+  else Serial.println("Waiting for more stable readings");
 
   delay(20);
 }
