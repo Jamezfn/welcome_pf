@@ -37,17 +37,20 @@ int   angleIndex = 0;
 typedef struct { float engageAngle; float disengageAngle; } AngleThresholds;
 // Capacitor: engage at +36.87°, disengage at +18.19°
 AngleThresholds capThresh = { acos(0.80)*180.0/PI, acos(0.95)*180.0/PI };
-// Inductor: now engage at -45°, disengage at +20°
-AngleThresholds indThresh = { -45.0, 20.0 };
+// Inductor: engage at -40°, disengage at +10° (wider gap)
+AngleThresholds indThresh = { -40.0, 10.0 };
 
 // State machine for power factor correction
 enum PFCState { MONITORING, CAP_CORRECTION, IND_CORRECTION, CALIBRATING };
 PFCState currentState = MONITORING;
 
 // —— NO-LOAD & DEBOUNCE CONFIGURATION ——
-const float noLoadCurrent       = 0.1;       // A threshold to call “no load”
+const float noLoadCurrent       = 0.13;       // A threshold to call “no load”
+const float noLoadVoltage = 0.15;       // V threshold to call “no load”
 const unsigned long noLoadDelay = 3000;      // ms before we reset on no-load
 unsigned long noLoadSince       = 0;         // timer start for no-load
+const int REQUIRED_STABLE_READINGS = 3;
+int stableReadingCount = 0;
 
 const unsigned long minSwitchInterval = 5000; // ms minimum between ANY relay action
 unsigned long lastSwitchTime         = 0;    // last time we flipped a relay
@@ -67,6 +70,18 @@ float medianAngle(float *buf, int size) {
     temp[j+1] = key;
   }
   return temp[size/2];
+}
+
+bool isAngleStable(float rawAngle, float medianAngle) {
+  float difference = abs(rawAngle - medianAngle);
+  
+  // More strict stability check for angles near the thresholds
+  if ((rawAngle > -50 && rawAngle < -35) || // Near inductor engage threshold
+      (rawAngle > 5 && rawAngle < 15)) {    // Near inductor disengage threshold
+    return difference < 20.0; // More strict near thresholds
+  }
+  
+  return difference < 45.0; // Standard threshold elsewhere
 }
 
 void engageCap() {
@@ -226,35 +241,34 @@ void loop() {
                 Vrms, Irms, P, S, Q);
 
   // --- No-load detection & reset ---
-  if (Vrms >= 0.1) {
-    if (Irms < noLoadCurrent) {
-      if (noLoadSince == 0) noLoadSince = millis();
-      if (millis() - noLoadSince > noLoadDelay) {
-        // sustained no-load → full reset
-        digitalWrite(CAP_RELAY, LOW);
-        digitalWrite(IND_RELAY, LOW);
-        currentState = MONITORING;
-        lastSwitchTime = millis();
-        Serial.println("No-load detected: resetting all banks");
-      }
-      delay(2000);
-      return; // skip PF logic until a real load returns
-    } else {
-      noLoadSince = 0;
-    }
-  } else {
-    // AC gone: also full reset
+  if (Vrms < noLoadVoltage) {
+    // Very low voltage - treat as no AC or calibration issue
     digitalWrite(CAP_RELAY, LOW);
     digitalWrite(IND_RELAY, LOW);
     currentState = MONITORING;
     lastSwitchTime = millis();
-    Serial.println("AC OFF: resetting PF correction");
+    Serial.println("Low voltage detected: resetting all banks");
     delay(2000);
     return;
   }
 
-  // --- Normal PF correction with debounce & hysteresis ---
-  updatePFCState(medAngle);
+  // --- Check angle stability before making decisions ---
+  if (!isAngleStable(angle, medAngle)) {
+    Serial.println("Angle instability detected - skipping PFC update");
+    stableReadingCount = 0; // Reset the counter
+    delay(500);
+    return;
+  } else {
+    stableReadingCount++;
+    Serial.printf("Stable reading count: %d/%d\n", stableReadingCount, REQUIRED_STABLE_READINGS);
+    
+    // Only proceed with PFC update if we have enough consecutive stable readings
+    if (stableReadingCount >= REQUIRED_STABLE_READINGS) {
+      updatePFCState(medAngle);
+    } else {
+      Serial.println("Waiting for more stable readings before PFC update");
+    }
+  }
 
   delay(20);
 }
