@@ -51,6 +51,9 @@ const char* WIFI_SSID = "Hedy fidelity";
 const char* WIFI_PASS = "Onecaster2020";
 const char* PREDICT_URL = "http://192.168.7.219:5000/predict";
 
+const unsigned long PREDICTION_INTERVAL = 2000;
+unsigned long lastPredictionTime = 0;
+
 void reconnectWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.print("Reconnecting to WiFi...");
@@ -213,9 +216,7 @@ void setup(){
   filteredVoltage=analogRead(voltagePin);
   filteredCurrent=analogRead(currentPin);
   Serial.println("Enhanced Synchronous PF Correction Starting");
-}
-
-void loop(){
+}void loop(){
   if(inCooldownPeriod){
     if(millis()-cooldownStartTime<switchCooldownPeriod){
       Serial.printf("In cooldown: %lu/%lu ms\n",
@@ -269,9 +270,14 @@ void loop(){
                 angle, medAngle, pf);
   Serial.printf("Vrms: %.2f V, Irms: %.3f A | P: %.2f W\n", Vrms, Irms, P);
 
-  float E = sendForPrediction(P, Irms, pf);
-  if (!isnan(E)) {
-    Serial.printf("Predicted energy: %.4f\n", E);
+  float E = NAN;
+  if (millis() - lastPredictionTime >= PREDICTION_INTERVAL) {
+    E = sendForPrediction(P, Irms, pf);
+    lastPredictionTime = millis();
+    
+    if (!isnan(E)) {
+      Serial.printf("Predicted energy: %.4f\n", E);
+    }
   }
 
   if(Vrms < noLoadVoltage){
@@ -291,4 +297,5 @@ void loop(){
   else Serial.println("Waiting for more stable readings");
 
   delay(20);
+
 }
